@@ -1,4 +1,6 @@
-fastapi==0.109.1
-uvicorn[standard]==0.27.0.post1
+fastapi
+uvicorn[standard]
 paddleocr==2.7.0.3
-paddlepaddle==2.6.1
+paddlepaddle-gpu==2.5.2
+PyMuPDF
+opencv-python-headless
