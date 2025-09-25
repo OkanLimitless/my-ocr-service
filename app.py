@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="PaddleOCR Service", version="1.0.0")
 
 ocr_model: PaddleOCR | None = None
+OCR_INIT_TRIED = False
 
 CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MiB
@@ -38,24 +39,13 @@ SUPPORTED_CONTENT_TYPES = {
 }
 
 
-@app.on_event("startup")
-async def load_model() -> None:
-    global ocr_model
-    logger.info("Loading PaddleOCR model (lang=en, use_angle_cls=True)...")
-    try:
-        ocr_model = PaddleOCR(lang="en", use_angle_cls=True, show_log=False)
-        logger.info("PaddleOCR model loaded successfully.")
-    except Exception as exc:  # pragma: no cover - startup failure path
-        logger.exception("Failed to initialize PaddleOCR model.")
-        raise RuntimeError("PaddleOCR initialization failed") from exc
+@app.get("/")
+async def health() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
 
 @app.post("/ocr")
 async def run_ocr(file: UploadFile = File(...)) -> JSONResponse:
-    if ocr_model is None:
-        logger.error("OCR model is not available when handling a request.")
-        raise HTTPException(status_code=503, detail="OCR service not ready yet. Try again later.")
-
     if file.content_type and not (
         file.content_type in SUPPORTED_CONTENT_TYPES or file.content_type.startswith("image/")
     ):
@@ -78,10 +68,45 @@ async def run_ocr(file: UploadFile = File(...)) -> JSONResponse:
         await _close_upload(file)
 
 
+def get_model() -> PaddleOCR:
+    global ocr_model, OCR_INIT_TRIED
+
+    if ocr_model is not None:
+        return ocr_model
+
+    if OCR_INIT_TRIED:
+        raise RuntimeError("Previous PaddleOCR initialization failed. Inspect logs for details.")
+
+    OCR_INIT_TRIED = True
+    use_gpu = os.getenv("PADDLEOCR_USE_GPU", "1") != "0"
+
+    init_kwargs = {"lang": "en", "use_angle_cls": True, "show_log": False, "use_gpu": use_gpu}
+
+    try:
+        logger.info("Initializing PaddleOCR (use_gpu=%s)...", use_gpu)
+        ocr_model_local = PaddleOCR(**init_kwargs)
+        logger.info("PaddleOCR model loaded successfully.")
+        ocr_model = ocr_model_local
+        return ocr_model_local
+    except Exception as exc:
+        logger.warning("PaddleOCR GPU initialization failed: %s", exc)
+        if use_gpu:
+            try:
+                logger.info("Retrying PaddleOCR initialization on CPU...")
+                init_kwargs["use_gpu"] = False
+                ocr_model_local = PaddleOCR(**init_kwargs)
+                logger.info("PaddleOCR CPU model loaded successfully.")
+                ocr_model = ocr_model_local
+                return ocr_model_local
+            except Exception:
+                logger.exception("PaddleOCR CPU fallback also failed.")
+                raise
+        raise
+
+
 def _run_ocr(temp_path: str) -> List[List]:
-    if ocr_model is None:  # Should not happen; guard to satisfy type checker.
-        raise RuntimeError("OCR model is not initialized.")
-    return ocr_model.ocr(temp_path, cls=True)
+    model = get_model()
+    return model.ocr(temp_path, cls=True)
 
 
 async def _persist_upload(upload_file: UploadFile) -> str:
