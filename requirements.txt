@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
 paddleocr==2.7.0.3
-paddlepaddle-gpu==2.5.2
+paddlepaddle-gpu==2.6.1
 PyMuPDF
 opencv-python-headless

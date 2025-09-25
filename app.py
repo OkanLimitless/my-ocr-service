@@ -7,13 +7,19 @@ import tempfile
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
-from paddleocr import PaddleOCR
-
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("my_ocr_service")
+
+try:
+    from paddleocr import PaddleOCR
+except Exception as import_exc:  # pragma: no cover - import error path
+    logger.exception(
+        "Failed to import PaddleOCR. Verify GPU drivers and paddlepaddle-gpu wheel compatibility."  # noqa: E501
+    )
+    raise
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="PaddleOCR Service", version="1.0.0")
 
