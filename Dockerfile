@@ -15,12 +15,28 @@ RUN apt-get update \
         libxext6 \
         libxrender1 \
         libgl1 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PADDLEOCR_HOME=/root/.paddleocr
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install --no-cache-dir -r requirements.txt \
-    && python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='en', use_angle_cls=True, use_gpu=False)"
+ENV PADDLEOCR_HOME=/root/.paddleocr/whl \
+    PADDLEOCR_DET_MODEL_DIR=/root/.paddleocr/whl/det/en/en_PP-OCRv3_det_infer \
+    PADDLEOCR_REC_MODEL_DIR=/root/.paddleocr/whl/rec/en/en_PP-OCRv4_rec_infer \
+    PADDLEOCR_CLS_MODEL_DIR=/root/.paddleocr/whl/cls/ch_ppocr_mobile_v2.0_cls_infer
+
+RUN mkdir -p /root/.paddleocr/whl/det/en \
+    /root/.paddleocr/whl/rec/en \
+    /root/.paddleocr/whl/cls \
+    && curl -L "https://paddleocr.bj.bcebos.com/PP-OCRv3/english/en_PP-OCRv3_det_infer.tar" -o /tmp/en_det.tar \
+    && tar -xf /tmp/en_det.tar -C /root/.paddleocr/whl/det/en \
+    && rm /tmp/en_det.tar \
+    && curl -L "https://paddleocr.bj.bcebos.com/PP-OCRv4/english/en_PP-OCRv4_rec_infer.tar" -o /tmp/en_rec.tar \
+    && tar -xf /tmp/en_rec.tar -C /root/.paddleocr/whl/rec/en \
+    && rm /tmp/en_rec.tar \
+    && curl -L "https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar" -o /tmp/cls.tar \
+    && tar -xf /tmp/cls.tar -C /root/.paddleocr/whl/cls \
+    && rm /tmp/cls.tar
 
 COPY . /app
 

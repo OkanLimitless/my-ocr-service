@@ -39,7 +39,7 @@ For ad-hoc testing you can still send `url` or `base64` fields—the handler wil
 
 The container automatically starts the serverless loop when executed as a module (see `runpod.yaml`). Set `RUNPOD_DISABLE_SERVERLESS=1` when running locally to bypass the loop (for unit tests or manual invocations).
 
-Model artifacts are warmed during the Docker build so first-run latency stays low. If you change PaddleOCR languages, rebuild the image so the new models are cached inside `/root/.paddleocr`.
+PaddleOCR weights are downloaded inside the Docker build, so cold starts do not fetch models. When switching languages, adjust the download URLs in the `Dockerfile` to bundle the desired models.
 
 ### Local FastAPI testing
 
