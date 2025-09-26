@@ -23,18 +23,27 @@ RUN apt-get update \
         libxext6 \
         libxrender1 \
         libgl1 \
-        gnupg \
-        libcudnn8 \
-        libcudnn8-dev \
-        libnccl2 \
-        libnccl-dev \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget gnupg \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && rm /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libcudnn8=8.9.6.50-1+cuda12.1 \
+        libcudnn8-dev=8.9.6.50-1+cuda12.1 \
+        libnccl2=2.18.1-1+cuda12.1 \
+        libnccl-dev=2.18.1-1+cuda12.1 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN ldconfig \
     && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir paddlepaddle-gpu==2.6.1.post121 -f https://www.paddlepaddle.org.cn/whl/cu121
+    && pip install --no-cache-dir paddlepaddle-gpu==2.6.1.post121 -f https://www.paddlepaddle.org.cn/whl/cu121 \
+    && python -c "import paddle; paddle.utils.run_check()"
 
 ENV PADDLEOCR_HOME=/root/.paddleocr/whl \
     PADDLEOCR_DET_MODEL_DIR=/root/.paddleocr/whl/det/en/en_PP-OCRv3_det_infer \
