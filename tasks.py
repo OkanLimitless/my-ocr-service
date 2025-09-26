@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import threading
@@ -17,19 +18,31 @@ import pypdfium2 as pdfium
 from celery_app import celery_app
 
 
+logger = logging.getLogger("ocr_tasks")
+
+
 def s3_client():
     endpoint = os.getenv("S3_ENDPOINT_URL")
     region = os.getenv("S3_REGION")
     key_id = os.getenv("S3_ACCESS_KEY_ID")
     secret = os.getenv("S3_SECRET_ACCESS_KEY")
     session = boto3.session.Session()
-    return session.client(
+    client = session.client(
         "s3",
         endpoint_url=endpoint,
         region_name=region,
         aws_access_key_id=key_id,
         aws_secret_access_key=secret,
     )
+    logger.debug(
+        "Initialized S3 client",
+        extra={
+            "endpoint": endpoint,
+            "region": region,
+            "bucket": os.getenv("S3_BUCKET"),
+        },
+    )
+    return client
 
 
 def _canonicalize_db_url(url: str) -> str:
@@ -380,10 +393,45 @@ def _store_page_payload(
         payload["error"] = result.error
     if result.note:
         payload["note"] = result.note
-    client.put_object(Bucket=bucket, Key=ocr_key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
+    logger.info(
+        "Uploading OCR page",
+        extra={
+            "document_id": document_id,
+            "page_index": result.page_index,
+            "status": "pending",
+            "ocr_key": ocr_key,
+        },
+    )
+    try:
+        client.put_object(
+            Bucket=bucket,
+            Key=ocr_key,
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to upload OCR page",
+            extra={
+                "document_id": document_id,
+                "page_index": result.page_index,
+                "ocr_key": ocr_key,
+            },
+        )
+        raise
 
     status = "ocr_done" if result.error is None else "failed"
     _upsert_page_row(document_id, result.page_index, ocr_key, status, result.engine)
+    logger.info(
+        "Stored OCR page",
+        extra={
+            "document_id": document_id,
+            "page_index": result.page_index,
+            "status": status,
+            "ocr_key": ocr_key,
+            "error": result.error,
+        },
+    )
     return ocr_key, status
 
 
@@ -1005,12 +1053,25 @@ def ocr_pdf_document(
     if not bucket:
         return {"error": "missing B2 bucket", "document_id": document_id}
 
+    logger.info(
+        "Starting PDF OCR",
+        extra={
+            "document_id": document_id,
+            "storage_key": storage_key,
+            "bucket": bucket,
+        },
+    )
+
     client = s3_client()
     try:
         pdf_obj = client.get_object(Bucket=bucket, Key=storage_key)
         pdf_bytes = pdf_obj["Body"].read()
         content_type = (pdf_obj.get("ContentType") or "application/pdf").lower()
     except Exception as exc:
+        logger.exception(
+            "Failed to download PDF",
+            extra={"document_id": document_id, "storage_key": storage_key},
+        )
         return {"error": f"download_pdf_failed: {exc}", "document_id": document_id}
 
     pdf_dpi = _env_float("PADDLEOCR_PDF_DPI", 180.0)
@@ -1020,6 +1081,10 @@ def ocr_pdf_document(
     except Exception as exc:
         image_pages = []
         render_error = f"pdf_render_failed: {exc}"
+        logger.exception(
+            "Failed to render PDF pages",
+            extra={"document_id": document_id, "storage_key": storage_key},
+        )
 
     if not image_pages:
         failure = OCRResult(page_index=1, text="", engine="paddleocr_error", error=render_error or "pdf_empty")
@@ -1036,6 +1101,15 @@ def ocr_pdf_document(
             asyncio.run(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
         except Exception:
             pass
+        logger.warning(
+            "PDF produced no pages",
+            extra={
+                "document_id": document_id,
+                "storage_key": storage_key,
+                "status": status,
+                "error": failure.error,
+            },
+        )
         return {"document_id": document_id, "pages": 0, "engine": failure.engine, "status": status}
 
     statuses: list[str] = []
@@ -1052,6 +1126,16 @@ def ocr_pdf_document(
             lang_hints=lang_hints,
         )
         statuses.append(status)
+        logger.info(
+            "Processed PDF page",
+            extra={
+                "document_id": document_id,
+                "page_index": page_index,
+                "status": status,
+                "engine": page_result.engine,
+                "error": page_result.error,
+            },
+        )
 
     page_count = len(image_pages)
     doc_status = "ocr_done" if statuses and all(s == "ocr_done" for s in statuses) else "failed"
@@ -1066,6 +1150,16 @@ def ocr_pdf_document(
         )
     except Exception:
         pass
+
+    logger.info(
+        "Completed PDF OCR",
+        extra={
+            "document_id": document_id,
+            "storage_key": storage_key,
+            "pages": page_count,
+            "status": doc_status,
+        },
+    )
 
     if doc_status == "ocr_done":
         try:
