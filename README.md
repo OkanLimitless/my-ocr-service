@@ -39,7 +39,7 @@ For ad-hoc testing you can still send `url` or `base64` fields—the handler wil
 
 The container automatically starts the serverless loop when executed as a module (see `runpod.yaml`). Set `RUNPOD_DISABLE_SERVERLESS=1` when running locally to bypass the loop (for unit tests or manual invocations).
 
-PaddleOCR weights are downloaded inside the Docker build, so cold starts do not fetch models. The container now ships on `nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04`, adds NVIDIA’s CUDA apt repo, installs the latest cuDNN/NCCL runtime and dev packages, and runs `paddle.utils.run_check()` during build after installing the CUDA 12.1 Paddle wheel (`paddlepaddle-gpu==2.6.1.post121`). PaddleOCR runs on GPU by default (`PADDLEOCR_USE_GPU=1`). When switching languages, adjust the download URLs in the `Dockerfile` to bundle the desired models.
+PaddleOCR weights are downloaded inside the Docker build, so cold starts do not fetch models. The container now ships on `nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04`, adds NVIDIA’s CUDA apt repo, installs cuDNN/NCCL/CUBLAS runtime + dev packages, and runs `paddle.utils.run_check()` during build after installing the CUDA 12.1 Paddle wheel (`paddlepaddle-gpu==2.6.1`). PaddleOCR runs on GPU by default (`PADDLEOCR_USE_GPU=1`). When switching languages, adjust the download URLs in the `Dockerfile` to bundle the desired models.
 
 ### Local FastAPI testing
 

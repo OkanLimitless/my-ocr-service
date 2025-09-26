@@ -38,6 +38,8 @@ RUN apt-get update \
         libcudnn8-dev \
         libnccl2 \
         libnccl-dev \
+        libcublas-12-1 \
+        libcublas-dev-12-1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ldconfig \
