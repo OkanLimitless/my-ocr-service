@@ -72,6 +72,12 @@ def _suffix_from_name(name: str | None) -> str:
     return suffix if suffix else ".png"
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+def start_serverless() -> None:
+    log_level_name = os.getenv("RUNPOD_LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(level=log_level)
     serverless.start({"handler": handler})
+
+
+if os.getenv("RUNPOD_DISABLE_SERVERLESS", "0") != "1":
+    start_serverless()

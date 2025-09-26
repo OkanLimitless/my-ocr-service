@@ -33,6 +33,8 @@ RunPod Serverless invokes `serverless_handler.handler`. A minimal payload looks 
 
 The handler also accepts `base64` plus an optional `suffix` field.
 
+The container auto-starts the serverless loop on import. Set `RUNPOD_DISABLE_SERVERLESS=1` when running locally to bypass the loop (for unit tests or manual invocations).
+
 ### Local FastAPI testing
 
 To run the HTTP API locally:
