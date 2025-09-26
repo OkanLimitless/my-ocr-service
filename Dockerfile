@@ -23,11 +23,18 @@ RUN apt-get update \
         libxext6 \
         libxrender1 \
         libgl1 \
+        gnupg \
+        libcudnn8 \
+        libcudnn8-dev \
+        libnccl2 \
+        libnccl-dev \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN ldconfig \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir paddlepaddle-gpu==2.6.1.post121 -f https://www.paddlepaddle.org.cn/whl/cu121
 
 ENV PADDLEOCR_HOME=/root/.paddleocr/whl \
     PADDLEOCR_DET_MODEL_DIR=/root/.paddleocr/whl/det/en/en_PP-OCRv3_det_infer \
