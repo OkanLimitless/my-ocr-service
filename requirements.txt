@@ -5,7 +5,10 @@ asyncpg
 requests
 runpod
 openai
-numpy
+fastapi
+uvicorn[standard]
+python-multipart
+numpy==1.26.4
 opencv-python-headless
 paddleocr==2.7.0.3
 paddlepaddle-gpu==2.6.1

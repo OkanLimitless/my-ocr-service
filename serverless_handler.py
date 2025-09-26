@@ -14,8 +14,15 @@ Returns a JSON object containing the task result or an error message.
 
 from __future__ import annotations
 
+import logging
+import os
 import traceback
 from typing import Any, Callable
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("serverless")
+
+logger.info("Importing Celery task definitions for serverless dispatch...")
 
 from tasks import ocr_document, ocr_page, ocr_pdf_document
 
@@ -40,15 +47,21 @@ def handler(event: dict[str, Any] | None) -> dict[str, Any]:
 
     fn = TASKS.get(task_name or "")
     if fn is None:
+        logger.warning("Unknown task %s", task_name)
         return {"status": "error", "error": f"unknown task {task_name}"}
 
     try:
         result = fn(**payload)
+        logger.info("Task %s completed", task_name)
         return {"status": "ok", "result": result}
     except Exception as exc:  # pragma: no cover - runtime diagnostics
         traceback.print_exc()
+        logger.exception("Task %s failed", task_name)
         return {"status": "error", "error": str(exc)}
 
-
 if __name__ == "__main__" and serverless is not None:
-    serverless.start({"handler": handler})
+    if os.getenv("RUNPOD_DISABLE_SERVERLESS", "0") == "1":
+        logger.info("RUNPOD_DISABLE_SERVERLESS=1; skipping serverless.start")
+    else:
+        logger.info("Starting RunPod serverless loop...")
+        serverless.start({"handler": handler})
