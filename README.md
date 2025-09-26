@@ -18,16 +18,33 @@ Run the helper script (requires `sudo`) to install OS packages, create the virtu
 sudo ./scripts/runpod_setup.sh
 ```
 
-### Starting the Celery worker
+### Serverless handler
 
-Activate the virtualenv and launch the worker manually:
+RunPod Serverless invokes `serverless_handler.handler`. A minimal payload looks like:
+
+```json
+{
+  "task": "tasks.ocr_document",
+  "payload": {
+    "url": "https://example.com/sample.png"
+  }
+}
+```
+
+The handler also accepts `base64` plus an optional `suffix` field.
+
+### Local FastAPI testing
+
+To run the HTTP API locally:
 
 ```bash
 source ~/ocr-venv/bin/activate
-celery -A celery_app.celery_app worker -Q ocr -l info -c ${CELERY_CONCURRENCY:-4}
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Or use the convenience wrapper:
+### Celery worker helper
+
+If you need to run the Celery queue consumer manually, use:
 
 ```bash
 ./scripts/run_celery_worker.sh

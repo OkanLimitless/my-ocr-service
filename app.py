@@ -178,3 +178,17 @@ def _extract_text(ocr_result: List) -> List[str]:
             if text:
                 texts.append(str(text))
     return texts
+
+
+def run_ocr_from_bytes(data: bytes, suffix: str = ".png") -> List[str]:
+    if not data:
+        raise ValueError("No data provided for OCR.")
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        temp_file.write(data)
+        temp_file.flush()
+        temp_file.close()
+        return _extract_text(_run_ocr(temp_file.name))
+    finally:
+        _cleanup_temp_file(temp_file.name)
