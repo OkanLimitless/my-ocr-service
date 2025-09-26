@@ -1,6 +1,7 @@
 numpy==1.26.4
 fastapi
 uvicorn[standard]
+python-multipart
 paddleocr==2.7.0.3
 paddlepaddle-gpu==2.6.1
 PyMuPDF
