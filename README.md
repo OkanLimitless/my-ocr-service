@@ -20,20 +20,24 @@ sudo ./scripts/runpod_setup.sh
 
 ### Serverless handler
 
-RunPod Serverless invokes `serverless_handler.handler`. A minimal payload looks like:
+RunPod Serverless invokes `serverless_handler.handler`. The API submits payloads that mirror the Celery task signature:
 
 ```json
 {
-  "task": "tasks.ocr_document",
-  "payload": {
-    "url": "https://example.com/sample.png"
+  "input": {
+    "task": "tasks.ocr_document",
+    "payload": {
+      "document_id": "…",
+      "storage_key": "…",
+      "lang_hints": ["en"]
+    }
   }
 }
 ```
 
-The handler also accepts `base64` plus an optional `suffix` field.
+For ad-hoc testing you can still send `url` or `base64` fields—the handler will decode them and call the same task logic.
 
-The container auto-starts the serverless loop on import. Set `RUNPOD_DISABLE_SERVERLESS=1` when running locally to bypass the loop (for unit tests or manual invocations).
+The container automatically starts the serverless loop when executed as a module (see `runpod.yaml`). Set `RUNPOD_DISABLE_SERVERLESS=1` when running locally to bypass the loop (for unit tests or manual invocations).
 
 ### Local FastAPI testing
 
