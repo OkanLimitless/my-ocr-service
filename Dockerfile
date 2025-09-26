@@ -17,7 +17,10 @@ RUN apt-get update \
         libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r requirements.txt
+ENV PADDLEOCR_HOME=/root/.paddleocr
+
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='en', use_angle_cls=True, use_gpu=False)"
 
 COPY . /app
 
