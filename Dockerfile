@@ -33,7 +33,7 @@ RUN apt-get update \
     && dpkg -i /tmp/cuda-keyring.deb \
     && rm /tmp/cuda-keyring.deb \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends --allow-change-held-packages \
         libcudnn8 \
         libcudnn8-dev \
         libnccl2 \
