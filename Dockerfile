@@ -42,7 +42,7 @@ RUN apt-get update \
 
 RUN ldconfig \
     && pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir paddlepaddle-gpu==2.6.1.post121 -f https://www.paddlepaddle.org.cn/whl/cu121 \
+    && pip install --no-cache-dir paddlepaddle-gpu==2.6.1 -f https://www.paddlepaddle.org.cn/whl/cu121 \
     && python -c "import paddle; paddle.utils.run_check()"
 
 ENV PADDLEOCR_HOME=/root/.paddleocr/whl \
