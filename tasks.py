@@ -26,6 +26,31 @@ else:
     logger.info("DATABASE_URL not provided; database writes disabled")
 
 
+def _run_sync(coro):
+    """Execute an async coroutine even when an event loop is already running."""
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result_holder: dict[str, object] = {}
+
+    def _runner() -> None:
+        try:
+            result_holder["result"] = asyncio.run(coro)
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            result_holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "error" in result_holder:
+        raise result_holder["error"]  # type: ignore[misc]
+    return result_holder.get("result")
+
+
 def s3_client():
     endpoint = os.getenv("S3_ENDPOINT_URL")
     region = os.getenv("S3_REGION")
@@ -543,7 +568,7 @@ def ocr_document(
             lang_hints=lang_hints,
         )
         try:
-            asyncio.run(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
+            _run_sync(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
         except Exception as exc:
             logger.warning(
                 "Failed to update document status (pdf skip): %s",
@@ -567,7 +592,7 @@ def ocr_document(
         }
         client.put_object(Bucket=bucket, Key=ocr_key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
         try:
-            asyncio.run(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
+            _run_sync(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
         except Exception as exc:
             logger.warning(
                 "Failed to mark document download error: %s",
@@ -587,7 +612,7 @@ def ocr_document(
         lang_hints=lang_hints,
     )
     try:
-        asyncio.run(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
+        _run_sync(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
     except Exception as exc:
         logger.warning(
             "Failed to update document status: %s",
@@ -825,7 +850,7 @@ def summary_generate(document_id: str, text_keys: list[str] | None = None):
     key = f"assets/{document_id}/summary.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
     try:
-        asyncio.run(_db_exec("insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)", uuid.uuid4(), uuid.UUID(document_id), "summary", key))
+        _run_sync(_db_exec("insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)", uuid.uuid4(), uuid.UUID(document_id), "summary", key))
     except Exception:
         pass
     return {"document_id": document_id, "summary_key": key, "engine": engine}
@@ -1126,7 +1151,7 @@ def ocr_pdf_document(
             lang_hints=lang_hints,
         )
         try:
-            asyncio.run(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
+            _run_sync(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
         except Exception as exc:
             logger.warning(
                 "Failed to update document status for empty PDF: %s",
