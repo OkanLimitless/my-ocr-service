@@ -1,13 +1,14 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, List, Tuple
+from typing import Iterable, List, Tuple
 
 import boto3
 import cv2
@@ -17,19 +18,61 @@ import pypdfium2 as pdfium
 from celery_app import celery_app
 
 
+logger = logging.getLogger("ocr_tasks")
+
+if os.getenv("DATABASE_URL"):
+    logger.info("DATABASE_URL detected at startup")
+else:
+    logger.info("DATABASE_URL not provided; database writes disabled")
+
+
+def _run_sync(coro):
+    """Execute an async coroutine even when an event loop is already running."""
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result_holder: dict[str, object] = {}
+
+    def _runner() -> None:
+        try:
+            result_holder["result"] = asyncio.run(coro)
+        except Exception as exc:  # pragma: no cover - diagnostic path
+            result_holder["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "error" in result_holder:
+        raise result_holder["error"]  # type: ignore[misc]
+    return result_holder.get("result")
+
+
 def s3_client():
     endpoint = os.getenv("S3_ENDPOINT_URL")
     region = os.getenv("S3_REGION")
     key_id = os.getenv("S3_ACCESS_KEY_ID")
     secret = os.getenv("S3_SECRET_ACCESS_KEY")
     session = boto3.session.Session()
-    return session.client(
+    client = session.client(
         "s3",
         endpoint_url=endpoint,
         region_name=region,
         aws_access_key_id=key_id,
         aws_secret_access_key=secret,
     )
+    logger.debug(
+        "Initialized S3 client",
+        extra={
+            "endpoint": endpoint,
+            "region": region,
+            "bucket": os.getenv("S3_BUCKET"),
+        },
+    )
+    return client
 
 
 def _canonicalize_db_url(url: str) -> str:
@@ -57,12 +100,23 @@ async def _db_exec(query: str, *args):
 
     dsn = _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
     if not dsn:
+        logger.debug("DATABASE_URL not set; skipping query", extra={"query": query})
         return None
-    conn = await asyncpg.connect(dsn)
     try:
-        return await conn.execute(query, *args)
-    finally:
-        await conn.close()
+        conn = await asyncpg.connect(dsn)
+        logger.debug("Connected to PostgreSQL", extra={"query": query.split()[0] if query else ""})
+        try:
+            result = await conn.execute(query, *args)
+            logger.info(
+                "Executed query",
+                extra={"query": query.split()[0] if query else "", "result": result},
+            )
+            return result
+        finally:
+            await conn.close()
+    except Exception:
+        logger.exception("Database execution failed", extra={"query": query})
+        raise
 
 
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "60000"))
@@ -80,31 +134,6 @@ class OCRResult:
 _PADDLE_LOCK = threading.Lock()
 _PADDLE_MODELS: dict[str, object] = {}
 _PADDLE_ERRORS: dict[str, str] = {}
-
-
-def _sync_await(coro: Any) -> Any:
-    """Synchronously wait for an async coroutine even if a loop is already running."""
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    result: dict[str, Any] = {}
-
-    def _runner() -> None:
-        try:
-            result["value"] = asyncio.run(coro)
-        except Exception as exc:  # pragma: no cover - safeguards runtime issues
-            result["error"] = exc
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join()
-
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
 
 _PADDLE_LANG_ALIASES = {
     "en": "en",
@@ -347,7 +376,7 @@ def _iter_pdf_page_images(pdf_bytes: bytes, dpi: float) -> list[tuple[int, bytes
 
 def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: str, engine: str) -> None:
     try:
-        updated = _sync_await(
+        updated = asyncio.run(
             _db_exec(
                 "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
                 ocr_key,
@@ -363,7 +392,7 @@ def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: st
             if len(parts) == 2 and parts[0] == "UPDATE" and parts[1] != "0":
                 needs_insert = False
         if needs_insert:
-            _sync_await(
+            asyncio.run(
                 _db_exec(
                     "insert into pages(id, document_id, page_index, text_key, status, engine) values($1,$2,$3,$4,$5,$6)",
                     uuid.uuid4(),
@@ -405,10 +434,45 @@ def _store_page_payload(
         payload["error"] = result.error
     if result.note:
         payload["note"] = result.note
-    client.put_object(Bucket=bucket, Key=ocr_key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
+    logger.info(
+        "Uploading OCR page",
+        extra={
+            "document_id": document_id,
+            "page_index": result.page_index,
+            "status": "pending",
+            "ocr_key": ocr_key,
+        },
+    )
+    try:
+        client.put_object(
+            Bucket=bucket,
+            Key=ocr_key,
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to upload OCR page",
+            extra={
+                "document_id": document_id,
+                "page_index": result.page_index,
+                "ocr_key": ocr_key,
+            },
+        )
+        raise
 
     status = "ocr_done" if result.error is None else "failed"
     _upsert_page_row(document_id, result.page_index, ocr_key, status, result.engine)
+    logger.info(
+        "Stored OCR page",
+        extra={
+            "document_id": document_id,
+            "page_index": result.page_index,
+            "status": status,
+            "ocr_key": ocr_key,
+            "error": result.error,
+        },
+    )
     return ocr_key, status
 
 
@@ -504,9 +568,13 @@ def ocr_document(
             lang_hints=lang_hints,
         )
         try:
-            _sync_await(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
-        except Exception:
-            pass
+            _run_sync(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
+        except Exception as exc:
+            logger.warning(
+                "Failed to update document status (pdf skip): %s",
+                exc,
+                extra={"document_id": document_id, "status": status},
+            )
         return {"document_id": document_id, "ocr_key": ocr_key, "engine": skip_result.engine, "status": status}
 
     try:
@@ -524,9 +592,13 @@ def ocr_document(
         }
         client.put_object(Bucket=bucket, Key=ocr_key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
         try:
-            _sync_await(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
-        except Exception:
-            pass
+            _run_sync(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
+        except Exception as exc:
+            logger.warning(
+                "Failed to mark document download error: %s",
+                exc,
+                extra={"document_id": document_id},
+            )
         return {"document_id": document_id, "ocr_key": ocr_key, "status": "failed"}
 
     result = _ocr_image_with_model(body_bytes, page_index=1, lang_hints=lang_hints)
@@ -540,9 +612,13 @@ def ocr_document(
         lang_hints=lang_hints,
     )
     try:
-        _sync_await(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
-    except Exception:
-        pass
+        _run_sync(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
+    except Exception as exc:
+        logger.warning(
+            "Failed to update document status: %s",
+            exc,
+            extra={"document_id": document_id, "status": status},
+        )
 
     return {"document_id": document_id, "ocr_key": ocr_key, "engine": result.engine, "status": status}
 
@@ -684,7 +760,7 @@ def summarize_document(document_id: str, text_keys: list[str] | None = None, **_
 
     # Insert outputs row if DB configured
     try:
-        _sync_await(
+        asyncio.run(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
@@ -774,7 +850,7 @@ def summary_generate(document_id: str, text_keys: list[str] | None = None):
     key = f"assets/{document_id}/summary.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
     try:
-        _sync_await(_db_exec("insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)", uuid.uuid4(), uuid.UUID(document_id), "summary", key))
+        _run_sync(_db_exec("insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)", uuid.uuid4(), uuid.UUID(document_id), "summary", key))
     except Exception:
         pass
     return {"document_id": document_id, "summary_key": key, "engine": engine}
@@ -802,7 +878,7 @@ def _aggregate_document_text(client, bucket: str, document_id: str, text_keys: l
                     return [r["text_key"] for r in rows]
                 finally:
                     await conn.close()
-            keys_to_read = _sync_await(_fetch_keys()) or []
+            keys_to_read = asyncio.run(_fetch_keys()) or []
         except Exception:
             keys_to_read = []
         if not keys_to_read:
@@ -977,7 +1053,7 @@ def ocr_page(
 
     # Update page row
     try:
-        _sync_await(
+        asyncio.run(
             _db_exec(
                 "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
                 ocr_key,
@@ -1006,7 +1082,7 @@ def ocr_page(
             finally:
                 await conn.close()
             return False
-        done_all = _sync_await(_check_all_done())
+        done_all = asyncio.run(_check_all_done())
     except Exception:
         done_all = False
     if done_all:
@@ -1030,12 +1106,25 @@ def ocr_pdf_document(
     if not bucket:
         return {"error": "missing B2 bucket", "document_id": document_id}
 
+    logger.info(
+        "Starting PDF OCR",
+        extra={
+            "document_id": document_id,
+            "storage_key": storage_key,
+            "bucket": bucket,
+        },
+    )
+
     client = s3_client()
     try:
         pdf_obj = client.get_object(Bucket=bucket, Key=storage_key)
         pdf_bytes = pdf_obj["Body"].read()
         content_type = (pdf_obj.get("ContentType") or "application/pdf").lower()
     except Exception as exc:
+        logger.exception(
+            "Failed to download PDF",
+            extra={"document_id": document_id, "storage_key": storage_key},
+        )
         return {"error": f"download_pdf_failed: {exc}", "document_id": document_id}
 
     pdf_dpi = _env_float("PADDLEOCR_PDF_DPI", 180.0)
@@ -1045,6 +1134,10 @@ def ocr_pdf_document(
     except Exception as exc:
         image_pages = []
         render_error = f"pdf_render_failed: {exc}"
+        logger.exception(
+            "Failed to render PDF pages",
+            extra={"document_id": document_id, "storage_key": storage_key},
+        )
 
     if not image_pages:
         failure = OCRResult(page_index=1, text="", engine="paddleocr_error", error=render_error or "pdf_empty")
@@ -1058,9 +1151,22 @@ def ocr_pdf_document(
             lang_hints=lang_hints,
         )
         try:
-            _sync_await(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
-        except Exception:
-            pass
+            _run_sync(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
+        except Exception as exc:
+            logger.warning(
+                "Failed to update document status for empty PDF: %s",
+                exc,
+                extra={"document_id": document_id, "status": status},
+            )
+        logger.warning(
+            "PDF produced no pages",
+            extra={
+                "document_id": document_id,
+                "storage_key": storage_key,
+                "status": status,
+                "error": failure.error,
+            },
+        )
         return {"document_id": document_id, "pages": 0, "engine": failure.engine, "status": status}
 
     statuses: list[str] = []
@@ -1077,11 +1183,21 @@ def ocr_pdf_document(
             lang_hints=lang_hints,
         )
         statuses.append(status)
+        logger.info(
+            "Processed PDF page",
+            extra={
+                "document_id": document_id,
+                "page_index": page_index,
+                "status": status,
+                "engine": page_result.engine,
+                "error": page_result.error,
+            },
+        )
 
     page_count = len(image_pages)
     doc_status = "ocr_done" if statuses and all(s == "ocr_done" for s in statuses) else "failed"
     try:
-        _sync_await(
+        _run_sync(
             _db_exec(
                 "update documents set status=$1, page_count=$2 where id=$3",
                 doc_status,
@@ -1089,8 +1205,22 @@ def ocr_pdf_document(
                 uuid.UUID(document_id),
             )
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Failed to update document aggregate status: %s",
+            exc,
+            extra={"document_id": document_id, "status": doc_status},
+        )
+
+    logger.info(
+        "Completed PDF OCR",
+        extra={
+            "document_id": document_id,
+            "storage_key": storage_key,
+            "pages": page_count,
+            "status": doc_status,
+        },
+    )
 
     if doc_status == "ocr_done":
         try:
@@ -1196,7 +1326,7 @@ def flashcards_generate(document_id: str, count: int = 20):
     key = f"assets/{document_id}/flashcards.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"), ContentType="application/json")
     try:
-        _sync_await(
+        asyncio.run(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
@@ -1526,7 +1656,7 @@ def quiz_generate(document_id: str, target_count: int | None = None, qtype: str 
     key = f"assets/{document_id}/quiz.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"), ContentType="application/json")
     try:
-        _sync_await(
+        asyncio.run(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
