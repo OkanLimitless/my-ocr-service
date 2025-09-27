@@ -103,7 +103,12 @@ async def _db_exec(query: str, *args):
         logger.debug("DATABASE_URL not set; skipping query", extra={"query": query})
         return None
     try:
-        conn = await asyncpg.connect(dsn)
+        # Disable prepared statements for PgBouncer transaction/statement pooling compatibility.
+        conn = await asyncpg.connect(
+            dsn,
+            statement_cache_size=0,
+            max_cached_statement_lifetime=0,
+        )
         logger.debug("Connected to PostgreSQL", extra={"query": query.split()[0] if query else ""})
         try:
             result = await conn.execute(query, *args)
