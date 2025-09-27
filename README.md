@@ -41,6 +41,8 @@ The container automatically starts the serverless loop when executed as a module
 
 PaddleOCR weights are downloaded inside the Docker build, so cold starts do not fetch models. The container now ships on `nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04`, adds NVIDIA’s CUDA apt repo, installs cuDNN/NCCL/CUBLAS runtime + dev packages, and runs `paddle.utils.run_check()` during build after installing the CUDA 12.1 Paddle wheel (`paddlepaddle-gpu==2.6.1`). PaddleOCR runs on GPU by default (`PADDLEOCR_USE_GPU=1`). When switching languages, adjust the download URLs in the `Dockerfile` to bundle the desired models.
 
+For detailed logging (including database calls), set `RUNPOD_LOG_LEVEL=DEBUG` in your RunPod environment.
+
 ### Local FastAPI testing
 
 To run the HTTP API locally:

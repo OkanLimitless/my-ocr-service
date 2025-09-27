@@ -19,8 +19,11 @@ import os
 import traceback
 from typing import Any, Callable
 
-logging.basicConfig(level=logging.INFO)
+log_level_name = os.getenv("RUNPOD_LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+logging.basicConfig(level=log_level)
 logger = logging.getLogger("serverless")
+logger.info("Log level set to %s", logging.getLevelName(logger.level))
 
 logger.info("Importing Celery task definitions for serverless dispatch...")
 
