@@ -8,7 +8,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 import boto3
 import cv2
@@ -196,6 +196,63 @@ def _env_float(name: str, default: float) -> float:
         return float(val)
     except Exception:
         return default
+
+
+_ENABLE_FLASHCARD_TASKS = _env_flag("ENABLE_FLASHCARD_TASKS", "0")
+
+
+def _maybe_enqueue_flashcards(document_id: Optional[str], *, count: int = 20) -> bool:
+    if not document_id:
+        return False
+    if not _ENABLE_FLASHCARD_TASKS:
+        logger.debug(
+            "Skipping flashcards generation; ENABLE_FLASHCARD_TASKS disabled",
+            extra={"document_id": document_id, "count": count},
+        )
+        return False
+
+    connection = None
+    try:
+        connection = celery_app.connection_for_write()
+        connection.ensure_connection(max_retries=0)
+    except Exception as exc:
+        if connection is not None:
+            try:
+                connection.release()
+            except Exception:
+                pass
+            finally:
+                connection = None
+        logger.info(
+            "Skipping flashcards generation; broker unreachable",
+            extra={"document_id": document_id, "count": count, "error": str(exc)},
+        )
+        return False
+
+    try:
+        celery_app.send_task(
+            "tasks.flashcards_generate",
+            kwargs={"document_id": document_id, "count": count},
+            connection=connection,
+        )
+        logger.info(
+            "Queued flashcards_generate task",
+            extra={"document_id": document_id, "count": count},
+        )
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to enqueue flashcards_generate task",
+            exc_info=True,
+            extra={"document_id": document_id, "count": count},
+        )
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.release()
+            except Exception:
+                pass
 
 
 def _normalize_lang_code(value: str | None) -> str:
@@ -1086,10 +1143,7 @@ def ocr_page(
     except Exception:
         done_all = False
     if done_all:
-        try:
-            celery_app.send_task("tasks.flashcards_generate", kwargs={"document_id": document_id, "count": 20})
-        except Exception:
-            pass
+        _maybe_enqueue_flashcards(document_id, count=20)
     return {"document_id": document_id, "page_index": page_index, "ocr_key": ocr_key}
 
 
@@ -1223,10 +1277,7 @@ def ocr_pdf_document(
     )
 
     if doc_status == "ocr_done":
-        try:
-            celery_app.send_task("tasks.flashcards_generate", kwargs={"document_id": document_id, "count": 20})
-        except Exception:
-            pass
+        _maybe_enqueue_flashcards(document_id, count=20)
 
     return {"document_id": document_id, "pages": page_count, "engine": "paddleocr", "status": doc_status}
 
