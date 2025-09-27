@@ -20,6 +20,11 @@ from celery_app import celery_app
 
 logger = logging.getLogger("ocr_tasks")
 
+if os.getenv("DATABASE_URL"):
+    logger.info("DATABASE_URL detected at startup")
+else:
+    logger.info("DATABASE_URL not provided; database writes disabled")
+
 
 def s3_client():
     endpoint = os.getenv("S3_ENDPOINT_URL")
