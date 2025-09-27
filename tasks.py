@@ -542,13 +542,14 @@ def ocr_document(
             content_type=content_type,
             lang_hints=lang_hints,
         )
-    try:
-        asyncio.run(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
-    except Exception as exc:
-        logger.warning(
-            "Failed to update document status (pdf skip)",
-            extra={"document_id": document_id, "status": status, "error": str(exc)},
-        )
+        try:
+            asyncio.run(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
+        except Exception as exc:
+            logger.warning(
+                "Failed to update document status (pdf skip): %s",
+                exc,
+                extra={"document_id": document_id, "status": status},
+            )
         return {"document_id": document_id, "ocr_key": ocr_key, "engine": skip_result.engine, "status": status}
 
     try:
@@ -565,13 +566,14 @@ def ocr_document(
             "error": f"download_failed: {exc}",
         }
         client.put_object(Bucket=bucket, Key=ocr_key, Body=json.dumps(payload).encode("utf-8"), ContentType="application/json")
-    try:
-        asyncio.run(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
-    except Exception as exc:
-        logger.warning(
-            "Failed to mark document download error",
-            extra={"document_id": document_id, "error": str(exc)},
-        )
+        try:
+            asyncio.run(_db_exec("update documents set status=$1 where id=$2", "failed", uuid.UUID(document_id)))
+        except Exception as exc:
+            logger.warning(
+                "Failed to mark document download error: %s",
+                exc,
+                extra={"document_id": document_id},
+            )
         return {"document_id": document_id, "ocr_key": ocr_key, "status": "failed"}
 
     result = _ocr_image_with_model(body_bytes, page_index=1, lang_hints=lang_hints)
@@ -588,8 +590,9 @@ def ocr_document(
         asyncio.run(_db_exec("update documents set status=$1 where id=$2", status, uuid.UUID(document_id)))
     except Exception as exc:
         logger.warning(
-            "Failed to update document status",
-            extra={"document_id": document_id, "status": status, "error": str(exc)},
+            "Failed to update document status: %s",
+            exc,
+            extra={"document_id": document_id, "status": status},
         )
 
     return {"document_id": document_id, "ocr_key": ocr_key, "engine": result.engine, "status": status}
@@ -1126,8 +1129,9 @@ def ocr_pdf_document(
             asyncio.run(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
         except Exception as exc:
             logger.warning(
-                "Failed to update document status for empty PDF",
-                extra={"document_id": document_id, "status": status, "error": str(exc)},
+                "Failed to update document status for empty PDF: %s",
+                exc,
+                extra={"document_id": document_id, "status": status},
             )
         logger.warning(
             "PDF produced no pages",
@@ -1178,8 +1182,9 @@ def ocr_pdf_document(
         )
     except Exception as exc:
         logger.warning(
-            "Failed to update document aggregate status",
-            extra={"document_id": document_id, "status": doc_status, "error": str(exc)},
+            "Failed to update document aggregate status: %s",
+            exc,
+            extra={"document_id": document_id, "status": doc_status},
         )
 
     logger.info(
