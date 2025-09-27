@@ -70,12 +70,23 @@ async def _db_exec(query: str, *args):
 
     dsn = _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
     if not dsn:
+        logger.debug("DATABASE_URL not set; skipping query", extra={"query": query})
         return None
-    conn = await asyncpg.connect(dsn)
     try:
-        return await conn.execute(query, *args)
-    finally:
-        await conn.close()
+        conn = await asyncpg.connect(dsn)
+        logger.debug("Connected to PostgreSQL", extra={"query": query.split()[0] if query else ""})
+        try:
+            result = await conn.execute(query, *args)
+            logger.info(
+                "Executed query",
+                extra={"query": query.split()[0] if query else "", "result": result},
+            )
+            return result
+        finally:
+            await conn.close()
+    except Exception:
+        logger.exception("Database execution failed", extra={"query": query})
+        raise
 
 
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "60000"))
