@@ -1197,7 +1197,7 @@ def ocr_pdf_document(
     page_count = len(image_pages)
     doc_status = "ocr_done" if statuses and all(s == "ocr_done" for s in statuses) else "failed"
     try:
-        asyncio.run(
+        _run_sync(
             _db_exec(
                 "update documents set status=$1, page_count=$2 where id=$3",
                 doc_status,
