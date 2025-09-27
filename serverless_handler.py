@@ -25,6 +25,11 @@ logging.basicConfig(level=log_level)
 logger = logging.getLogger("serverless")
 logger.info("Log level set to %s", logging.getLevelName(logger.level))
 
+# Hide extremely noisy DEBUG logs from the filelock package that RunPod uses
+# internally to coordinate the local job cache.
+filelock_logger = logging.getLogger("filelock")
+filelock_logger.setLevel(max(logging.INFO, log_level))
+
 logger.info("Importing Celery task definitions for serverless dispatch...")
 
 from tasks import ocr_document, ocr_page, ocr_pdf_document
