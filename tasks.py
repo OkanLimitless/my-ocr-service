@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, List, Tuple, Optional
@@ -26,29 +27,68 @@ else:
     logger.info("DATABASE_URL not provided; database writes disabled")
 
 
+_ASYNC_LOOP: asyncio.AbstractEventLoop | None = None
+_ASYNC_LOOP_THREAD: threading.Thread | None = None
+_ASYNC_LOOP_LOCK = threading.Lock()
+
+
+def _ensure_async_loop() -> asyncio.AbstractEventLoop:
+    global _ASYNC_LOOP, _ASYNC_LOOP_THREAD
+    loop = _ASYNC_LOOP
+    if loop is not None and loop.is_running():
+        return loop
+
+    with _ASYNC_LOOP_LOCK:
+        loop = _ASYNC_LOOP
+        if loop is not None and loop.is_running():
+            return loop
+
+        new_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _runner() -> None:
+            asyncio.set_event_loop(new_loop)
+            ready.set()
+            new_loop.run_forever()
+
+        thread = threading.Thread(target=_runner, name="ocr-async", daemon=True)
+        thread.start()
+        ready.wait()
+        _ASYNC_LOOP = new_loop
+        _ASYNC_LOOP_THREAD = thread
+        return new_loop
+
+
 def _run_sync(coro):
-    """Execute an async coroutine even when an event loop is already running."""
+    """Execute an async coroutine, reusing a background event loop when needed."""
 
     try:
-        loop = asyncio.get_running_loop()
+        running_loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        running_loop = None
 
-    result_holder: dict[str, object] = {}
+    target_loop = _ensure_async_loop()
 
-    def _runner() -> None:
-        try:
-            result_holder["result"] = asyncio.run(coro)
-        except Exception as exc:  # pragma: no cover - diagnostic path
-            result_holder["error"] = exc
+    if running_loop is not None and running_loop.is_running():
+        result_holder: dict[str, object] = {}
 
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
-    thread.join()
+        def _runner() -> None:
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro, target_loop)
+                result_holder["result"] = future.result()
+            except Exception as exc:  # pragma: no cover - diagnostic path
+                result_holder["error"] = exc
 
-    if "error" in result_holder:
-        raise result_holder["error"]  # type: ignore[misc]
-    return result_holder.get("result")
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        thread.join()
+
+        if "error" in result_holder:
+            raise result_holder["error"]  # type: ignore[misc]
+        return result_holder.get("result")
+
+    future = asyncio.run_coroutine_threadsafe(coro, target_loop)
+    return future.result()
 
 
 def s3_client():
@@ -95,33 +135,129 @@ def _canonicalize_db_url(url: str) -> str:
     return f"{scheme}://{user_q}:{pwd_q}@{hostpart}"
 
 
-async def _db_exec(query: str, *args):
+_DB_POOL: object | None = None
+_DB_POOL_DSN: str | None = None
+_DB_POOL_LOCK: asyncio.Lock | None = None
+_DB_POOL_MIN_SIZE = max(1, int(os.getenv("DB_POOL_MIN_SIZE", "1")))
+_DB_POOL_MAX_SIZE = max(_DB_POOL_MIN_SIZE, int(os.getenv("DB_POOL_MAX_SIZE", "2")))
+
+
+def _database_dsn() -> str:
+    return _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
+
+
+async def _invalidate_db_pool() -> None:
+    global _DB_POOL, _DB_POOL_DSN
+    pool = _DB_POOL
+    _DB_POOL = None
+    _DB_POOL_DSN = None
+    if pool is not None:
+        with suppress(Exception):
+            await pool.close()  # type: ignore[attr-defined]
+
+
+async def _get_db_pool(dsn: str):
     import asyncpg  # lazy import
 
-    dsn = _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
+    global _DB_POOL, _DB_POOL_DSN, _DB_POOL_LOCK
+    if not dsn:
+        return None
+    if _DB_POOL is not None and _DB_POOL_DSN == dsn and not getattr(_DB_POOL, "_closed", False):
+        return _DB_POOL
+
+    if _DB_POOL_LOCK is None:
+        _DB_POOL_LOCK = asyncio.Lock()
+
+    async with _DB_POOL_LOCK:
+        if _DB_POOL is not None and _DB_POOL_DSN == dsn and not getattr(_DB_POOL, "_closed", False):
+            return _DB_POOL
+
+        if _DB_POOL is not None:
+            with suppress(Exception):
+                await _DB_POOL.close()  # type: ignore[attr-defined]
+
+        try:
+            pool = await asyncpg.create_pool(
+                dsn,
+                min_size=_DB_POOL_MIN_SIZE,
+                max_size=_DB_POOL_MAX_SIZE,
+                statement_cache_size=0,
+                max_cached_statement_lifetime=0,
+            )
+        except Exception:
+            await _invalidate_db_pool()
+            raise
+
+        _DB_POOL = pool
+        _DB_POOL_DSN = dsn
+        logger.debug(
+            "Initialized asyncpg pool",
+            extra={"min_size": _DB_POOL_MIN_SIZE, "max_size": _DB_POOL_MAX_SIZE},
+        )
+        return _DB_POOL
+
+
+async def _db_call(method: str, query: str, *args):
+    import asyncpg  # lazy import
+
+    dsn = _database_dsn()
     if not dsn:
         logger.debug("DATABASE_URL not set; skipping query", extra={"query": query})
         return None
-    try:
-        # Disable prepared statements for PgBouncer transaction/statement pooling compatibility.
-        conn = await asyncpg.connect(
-            dsn,
-            statement_cache_size=0,
-            max_cached_statement_lifetime=0,
-        )
-        logger.debug("Connected to PostgreSQL", extra={"query": query.split()[0] if query else ""})
+
+    attempts = 0
+    while True:
+        attempts += 1
+        pool = await _get_db_pool(dsn)
+        if pool is None:
+            return None
         try:
-            result = await conn.execute(query, *args)
-            logger.info(
-                "Executed query",
-                extra={"query": query.split()[0] if query else "", "result": result},
+            async with pool.acquire() as conn:  # type: ignore[attr-defined]
+                func = getattr(conn, method)
+                result = await func(query, *args)
+                if method == "execute":
+                    logger.info(
+                        "Executed query",
+                        extra={"query": query.split()[0] if query else "", "result": result},
+                    )
+                return result
+        except asyncpg.PoolAcquireTimeoutError as exc:
+            logger.warning(
+                "Database acquire timeout",
+                extra={"query": query, "attempt": attempts, "error": str(exc)},
             )
-            return result
-        finally:
-            await conn.close()
+            if attempts >= 2:
+                raise
+            await _invalidate_db_pool()
+        except OSError as exc:
+            logger.warning(
+                "Database operation failed due to socket error",
+                exc_info=True,
+                extra={"query": query, "attempt": attempts, "error": str(exc)},
+            )
+            if attempts >= 2:
+                raise
+            await _invalidate_db_pool()
+
+
+async def _db_exec(query: str, *args):
+    try:
+        return await _db_call("execute", query, *args)
     except Exception:
         logger.exception("Database execution failed", extra={"query": query})
         raise
+
+
+async def _db_fetch(query: str, *args):
+    return await _db_call("fetch", query, *args)
+
+
+async def _db_fetchval(query: str, *args):
+    return await _db_call("fetchval", query, *args)
+
+
+async def _db_fetchrow(query: str, *args):
+    return await _db_call("fetchrow", query, *args)
 
 
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "60000"))
@@ -438,7 +574,7 @@ def _iter_pdf_page_images(pdf_bytes: bytes, dpi: float) -> list[tuple[int, bytes
 
 def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: str, engine: str) -> None:
     try:
-        updated = asyncio.run(
+        updated = _run_sync(
             _db_exec(
                 "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
                 ocr_key,
@@ -454,7 +590,7 @@ def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: st
             if len(parts) == 2 and parts[0] == "UPDATE" and parts[1] != "0":
                 needs_insert = False
         if needs_insert:
-            asyncio.run(
+            _run_sync(
                 _db_exec(
                     "insert into pages(id, document_id, page_index, text_key, status, engine) values($1,$2,$3,$4,$5,$6)",
                     uuid.uuid4(),
@@ -822,7 +958,7 @@ def summarize_document(document_id: str, text_keys: list[str] | None = None, **_
 
     # Insert outputs row if DB configured
     try:
-        asyncio.run(
+        _run_sync(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
@@ -926,21 +1062,16 @@ def _aggregate_document_text(client, bucket: str, document_id: str, text_keys: l
     else:
         # Try to get all page text keys from DB; fallback to page-1
         try:
-            import asyncpg  # type: ignore
             async def _fetch_keys():
-                dsn = _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
-                if not dsn:
+                rows = await _db_fetch(
+                    "select text_key from pages where document_id=$1 and text_key is not null order by page_index",
+                    uuid.UUID(document_id),
+                )
+                if not rows:
                     return []
-                conn = await asyncpg.connect(dsn)
-                try:
-                    rows = await conn.fetch(
-                        "select text_key from pages where document_id=$1 and text_key is not null order by page_index",
-                        uuid.UUID(document_id),
-                    )
-                    return [r["text_key"] for r in rows]
-                finally:
-                    await conn.close()
-            keys_to_read = asyncio.run(_fetch_keys()) or []
+                return [r["text_key"] for r in rows]
+
+            keys_to_read = _run_sync(_fetch_keys()) or []
         except Exception:
             keys_to_read = []
         if not keys_to_read:
@@ -1115,7 +1246,7 @@ def ocr_page(
 
     # Update page row
     try:
-        asyncio.run(
+        _run_sync(
             _db_exec(
                 "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
                 ocr_key,
@@ -1125,26 +1256,31 @@ def ocr_page(
                 page_index,
             )
         )
-        # If all pages done, update document
-        import asyncpg  # type: ignore
-        async def _check_all_done():
-            dsn = _canonicalize_db_url(os.getenv("DATABASE_URL", ""))
-            if not dsn:
-                return False
-            conn = await asyncpg.connect(dsn)
-            try:
-                total = await conn.fetchval("select count(*) from pages where document_id=$1", uuid.UUID(document_id))
-                done = await conn.fetchval("select count(*) from pages where document_id=$1 and status='ocr_done'", uuid.UUID(document_id))
-                if total and done == total:
-                    row = await conn.fetchrow("select status from documents where id=$1", uuid.UUID(document_id))
-                    status = row["status"] if row else None
-                    if status != "ocr_done":
-                        await conn.execute("update documents set status='ocr_done' where id=$1", uuid.UUID(document_id))
-                        return True
-            finally:
-                await conn.close()
+
+        async def _check_all_done() -> bool:
+            total = await _db_fetchval(
+                "select count(*) from pages where document_id=$1",
+                uuid.UUID(document_id),
+            )
+            done = await _db_fetchval(
+                "select count(*) from pages where document_id=$1 and status='ocr_done'",
+                uuid.UUID(document_id),
+            )
+            if total and done == total:
+                row = await _db_fetchrow(
+                    "select status from documents where id=$1",
+                    uuid.UUID(document_id),
+                )
+                status = row["status"] if row else None
+                if status != "ocr_done":
+                    await _db_exec(
+                        "update documents set status='ocr_done' where id=$1",
+                        uuid.UUID(document_id),
+                    )
+                    return True
             return False
-        done_all = asyncio.run(_check_all_done())
+
+        done_all = bool(_run_sync(_check_all_done()))
     except Exception:
         done_all = False
     if done_all:
@@ -1382,7 +1518,7 @@ def flashcards_generate(document_id: str, count: int = 20):
     key = f"assets/{document_id}/flashcards.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"), ContentType="application/json")
     try:
-        asyncio.run(
+        _run_sync(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
@@ -1712,7 +1848,7 @@ def quiz_generate(document_id: str, target_count: int | None = None, qtype: str 
     key = f"assets/{document_id}/quiz.json"
     client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data).encode("utf-8"), ContentType="application/json")
     try:
-        asyncio.run(
+        _run_sync(
             _db_exec(
                 "insert into outputs(id, document_id, kind, storage_key) values($1,$2,$3,$4)",
                 uuid.uuid4(),
