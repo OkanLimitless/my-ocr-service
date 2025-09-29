@@ -135,6 +135,16 @@ def _canonicalize_db_url(url: str) -> str:
     return f"{scheme}://{user_q}:{pwd_q}@{hostpart}"
 
 
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
 _DB_POOL: object | None = None
 _DB_POOL_DSN: str | None = None
 _DB_POOL_LOCK: asyncio.Lock | None = None
@@ -394,16 +404,6 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(val)
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    try:
-        return int(val)
     except Exception:
         return default
 
