@@ -9,7 +9,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, List, Tuple, Optional
+from typing import Iterable, List, Tuple, Optional, Sequence
 
 import boto3
 import cv2
@@ -138,8 +138,8 @@ def _canonicalize_db_url(url: str) -> str:
 _DB_POOL: object | None = None
 _DB_POOL_DSN: str | None = None
 _DB_POOL_LOCK: asyncio.Lock | None = None
-_DB_POOL_MIN_SIZE = max(1, int(os.getenv("DB_POOL_MIN_SIZE", "1")))
-_DB_POOL_MAX_SIZE = max(_DB_POOL_MIN_SIZE, int(os.getenv("DB_POOL_MAX_SIZE", "2")))
+_DB_POOL_MIN_SIZE = max(1, _env_int("DB_POOL_MIN_SIZE", 1))
+_DB_POOL_MAX_SIZE = max(_DB_POOL_MIN_SIZE, _env_int("DB_POOL_MAX_SIZE", 2))
 
 
 def _database_dsn() -> str:
@@ -260,7 +260,60 @@ async def _db_fetchrow(query: str, *args):
     return await _db_call("fetchrow", query, *args)
 
 
+def _did_update(tag: str | None) -> bool:
+    if not tag:
+        return False
+    parts = tag.strip().split()
+    if len(parts) != 2:
+        return False
+    verb, count = parts[0].upper(), parts[1]
+    if verb != "UPDATE":
+        return False
+    return count != "0"
+
+
+async def _bulk_upsert_page_rows(document_id: str, updates: Sequence[dict[str, object]]) -> None:
+    if not updates:
+        return
+
+    dsn = _database_dsn()
+    if not dsn:
+        logger.debug(
+            "DATABASE_URL not set; skipping bulk upsert",
+            extra={"document_id": document_id, "pages": len(updates)},
+        )
+        return
+
+    pool = await _get_db_pool(dsn)
+    if pool is None:
+        return
+
+    doc_uuid = uuid.UUID(document_id)
+    async with pool.acquire() as conn:  # type: ignore[attr-defined]
+        for item in updates:
+            tag = await conn.execute(
+                "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
+                item["ocr_key"],
+                item["status"],
+                item["engine"],
+                doc_uuid,
+                item["page_index"],
+            )
+            if _did_update(tag):
+                continue
+            await conn.execute(
+                "insert into pages(id, document_id, page_index, text_key, status, engine) values($1,$2,$3,$4,$5,$6)",
+                uuid.uuid4(),
+                doc_uuid,
+                item["page_index"],
+                item["ocr_key"],
+                item["status"],
+                item["engine"],
+            )
+
+
 SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "60000"))
+_OCR_PAGE_FLUSH_BATCH = max(1, _env_int("OCR_PAGE_FLUSH_BATCH", 3))
 
 
 @dataclass
@@ -270,6 +323,12 @@ class OCRResult:
     engine: str
     error: str | None = None
     note: str | None = None
+
+
+@dataclass
+class _PageBatchItem:
+    page_index: int
+    result: OCRResult
 
 
 _PADDLE_LOCK = threading.Lock()
@@ -335,6 +394,16 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(val)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
     except Exception:
         return default
 
@@ -466,6 +535,42 @@ def _ensure_paddle_model(lang: str) -> tuple[object | None, str | None]:
             return None, message
 
 
+def _prewarm_paddle_models() -> None:
+    if not _env_flag("PADDLEOCR_PREWARM", "1"):
+        logger.info("PaddleOCR prewarm disabled via env")
+        return
+
+    preload = os.getenv("PADDLEOCR_PRELOAD_LANGS")
+    if preload:
+        hints = [entry.strip() for entry in preload.split(",") if entry.strip()]
+    else:
+        hints = ["en"]
+
+    loaded: list[str] = []
+    failed: list[tuple[str, str | None]] = []
+    for hint in hints:
+        code = _normalize_lang_code(hint)
+        model, err = _ensure_paddle_model(code)
+        if model is not None:
+            loaded.append(code)
+        else:
+            failed.append((code, err))
+
+    if loaded:
+        logger.info("PaddleOCR models preloaded", extra={"langs": loaded})
+    for code, err in failed:
+        logger.warning(
+            "PaddleOCR prewarm failed",
+            extra={"lang": code, "error": err},
+        )
+
+
+try:
+    _prewarm_paddle_models()
+except Exception:
+    logger.exception("PaddleOCR prewarm encountered an error")
+
+
 def _decode_image_bytes(image_bytes: bytes) -> np.ndarray | None:
     if not image_bytes:
         return None
@@ -574,33 +679,19 @@ def _iter_pdf_page_images(pdf_bytes: bytes, dpi: float) -> list[tuple[int, bytes
 
 def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: str, engine: str) -> None:
     try:
-        updated = _run_sync(
-            _db_exec(
-                "update pages set text_key=$1, status=$2, engine=$3 where document_id=$4 and page_index=$5",
-                ocr_key,
-                status,
-                engine,
-                uuid.UUID(document_id),
-                page_index,
+        _run_sync(
+            _bulk_upsert_page_rows(
+                document_id,
+                [
+                    {
+                        "page_index": page_index,
+                        "ocr_key": ocr_key,
+                        "status": status,
+                        "engine": engine,
+                    }
+                ],
             )
         )
-        needs_insert = True
-        if isinstance(updated, str):
-            parts = updated.strip().split()
-            if len(parts) == 2 and parts[0] == "UPDATE" and parts[1] != "0":
-                needs_insert = False
-        if needs_insert:
-            _run_sync(
-                _db_exec(
-                    "insert into pages(id, document_id, page_index, text_key, status, engine) values($1,$2,$3,$4,$5,$6)",
-                    uuid.uuid4(),
-                    uuid.UUID(document_id),
-                    page_index,
-                    ocr_key,
-                    status,
-                    engine,
-                )
-            )
     except Exception:
         pass
 
@@ -672,6 +763,79 @@ def _store_page_payload(
         },
     )
     return ocr_key, status
+
+
+def _flush_page_batch(
+    client,
+    bucket: str,
+    document_id: str,
+    storage_key: str,
+    batch: list[_PageBatchItem],
+    *,
+    content_type: str | None = None,
+    lang_hints: list[str] | None = None,
+) -> list[str]:
+    if not batch:
+        return []
+
+    hints = lang_hints or []
+    statuses: list[str] = []
+    updates: list[dict[str, object]] = []
+
+    for item in batch:
+        result = item.result
+        ocr_key = f"ocr/{document_id}/page-{item.page_index}.json"
+        payload = {
+            "document_id": document_id,
+            "page_index": item.page_index,
+            "storage_key": storage_key,
+            "text": result.text,
+            "engine": result.engine,
+        }
+        if content_type:
+            payload["content_type"] = content_type
+        if hints:
+            payload["lang_hints"] = hints
+        if result.error:
+            payload["error"] = result.error
+        if result.note:
+            payload["note"] = result.note
+
+        client.put_object(
+            Bucket=bucket,
+            Key=ocr_key,
+            Body=json.dumps(payload).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+        status = "ocr_done" if result.error is None else "failed"
+        statuses.append(status)
+        updates.append(
+            {
+                "page_index": item.page_index,
+                "ocr_key": ocr_key,
+                "status": status,
+                "engine": result.engine,
+            }
+        )
+
+        logger.info(
+            "Stored OCR page",
+            extra={
+                "document_id": document_id,
+                "page_index": item.page_index,
+                "status": status,
+                "ocr_key": ocr_key,
+                "error": result.error,
+            },
+        )
+
+    try:
+        _run_sync(_bulk_upsert_page_rows(document_id, updates))
+    except Exception:
+        pass
+
+    return statuses
 
 
 def _extract_page_index(key: str) -> int | None:
@@ -1365,29 +1529,43 @@ def ocr_pdf_document(
         return {"document_id": document_id, "pages": 0, "engine": failure.engine, "status": status}
 
     statuses: list[str] = []
-    for page_index, image_bytes in image_pages:
-        result = _ocr_image_with_model(image_bytes, page_index=page_index, lang_hints=lang_hints)
-        page_result = OCRResult(page_index, result.text or "", result.engine, result.error)
-        _, status = _store_page_payload(
+    pending_batch: list[_PageBatchItem] = []
+    lang_hint_list = _normalize_lang_hints(lang_hints)
+
+    def _flush_pending() -> None:
+        nonlocal pending_batch
+        if not pending_batch:
+            return
+        batch_statuses = _flush_page_batch(
             client,
             bucket,
             document_id,
             storage_key,
-            page_result,
+            pending_batch,
             content_type=content_type,
-            lang_hints=lang_hints,
+            lang_hints=lang_hint_list,
         )
-        statuses.append(status)
+        statuses.extend(batch_statuses)
+        pending_batch = []
+
+    for page_index, image_bytes in image_pages:
+        result = _ocr_image_with_model(image_bytes, page_index=page_index, lang_hints=lang_hints)
+        page_result = OCRResult(page_index, result.text or "", result.engine, result.error)
+        pending_batch.append(_PageBatchItem(page_index, page_result))
         logger.info(
             "Processed PDF page",
             extra={
                 "document_id": document_id,
                 "page_index": page_index,
-                "status": status,
+                "status": "pending",
                 "engine": page_result.engine,
                 "error": page_result.error,
             },
         )
+        if len(pending_batch) >= _OCR_PAGE_FLUSH_BATCH:
+            _flush_pending()
+
+    _flush_pending()
 
     page_count = len(image_pages)
     doc_status = "ocr_done" if statuses and all(s == "ocr_done" for s in statuses) else "failed"
