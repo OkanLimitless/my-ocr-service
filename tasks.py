@@ -652,29 +652,28 @@ def _ocr_image_with_model(image_bytes: bytes, *, page_index: int, lang_hints: It
     return OCRResult(page_index, text, engine)
 
 
-def _iter_pdf_page_images(pdf_bytes: bytes, dpi: float) -> list[tuple[int, bytes]]:
-    if not pdf_bytes:
-        return []
+def _extract_pdf_page_text(page) -> str:
     try:
-        document = pdfium.PdfDocument(pdf_bytes)
+        text_page = page.get_textpage()
     except Exception:
-        return []
-
-    scale = max(dpi, 72.0) / 72.0
-    page_images: list[tuple[int, bytes]] = []
+        return ""
     try:
-        for idx in range(len(document)):
-            page = document[idx]
-            bitmap = page.render(scale=scale)
-            pil_image = bitmap.to_pil()
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="PNG")
-            page_images.append((idx + 1, buffer.getvalue()))
-            bitmap.close()
-            page.close()
+        raw = text_page.get_text_range() or ""
     finally:
-        document.close()
-    return page_images
+        text_page.close()
+    cleaned = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return cleaned
+
+
+def _render_pdf_page_image(page, scale: float) -> bytes:
+    bitmap = page.render(scale=scale)
+    try:
+        pil_image = bitmap.to_pil()
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format="PNG")
+        return buffer.getvalue()
+    finally:
+        bitmap.close()
 
 
 def _upsert_page_row(document_id: str, page_index: int, ocr_key: str, status: str, engine: str) -> None:
@@ -1487,19 +1486,20 @@ def ocr_pdf_document(
         return {"error": f"download_pdf_failed: {exc}", "document_id": document_id}
 
     pdf_dpi = _env_float("PADDLEOCR_PDF_DPI", 180.0)
+    scale = max(pdf_dpi, 72.0) / 72.0
+    statuses: list[str] = []
+    pending_batch: list[_PageBatchItem] = []
+    lang_hint_list = _normalize_lang_hints(lang_hints)
+    page_total = 0
+
     try:
-        image_pages = _iter_pdf_page_images(pdf_bytes, pdf_dpi)
-        render_error = None
+        document = pdfium.PdfDocument(pdf_bytes)
     except Exception as exc:
-        image_pages = []
-        render_error = f"pdf_render_failed: {exc}"
         logger.exception(
-            "Failed to render PDF pages",
+            "Failed to open PDF for OCR",
             extra={"document_id": document_id, "storage_key": storage_key},
         )
-
-    if not image_pages:
-        failure = OCRResult(page_index=1, text="", engine="paddleocr_error", error=render_error or "pdf_empty")
+        failure = OCRResult(page_index=1, text="", engine="paddleocr_error", error=f"pdf_open_failed: {exc}")
         ocr_key, status = _store_page_payload(
             client,
             bucket,
@@ -1511,63 +1511,119 @@ def ocr_pdf_document(
         )
         try:
             _run_sync(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
-        except Exception as exc:
+        except Exception as inner_exc:
             logger.warning(
-                "Failed to update document status for empty PDF: %s",
-                exc,
+                "Failed to update document status for unopened PDF: %s",
+                inner_exc,
                 extra={"document_id": document_id, "status": status},
             )
-        logger.warning(
-            "PDF produced no pages",
-            extra={
-                "document_id": document_id,
-                "storage_key": storage_key,
-                "status": status,
-                "error": failure.error,
-            },
-        )
         return {"document_id": document_id, "pages": 0, "engine": failure.engine, "status": status}
 
-    statuses: list[str] = []
-    pending_batch: list[_PageBatchItem] = []
-    lang_hint_list = _normalize_lang_hints(lang_hints)
+    try:
+        page_total = len(document)
+        if page_total == 0:
+            failure = OCRResult(page_index=1, text="", engine="paddleocr_error", error="pdf_empty")
+            ocr_key, status = _store_page_payload(
+                client,
+                bucket,
+                document_id,
+                storage_key,
+                failure,
+                content_type=content_type,
+                lang_hints=lang_hints,
+            )
+            try:
+                _run_sync(_db_exec("update documents set status=$1, page_count=$2 where id=$3", status, 0, uuid.UUID(document_id)))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to update document status for empty PDF: %s",
+                    exc,
+                    extra={"document_id": document_id, "status": status},
+                )
+            logger.warning(
+                "PDF produced no pages",
+                extra={
+                    "document_id": document_id,
+                    "storage_key": storage_key,
+                    "status": status,
+                    "error": failure.error,
+                },
+            )
+            return {"document_id": document_id, "pages": 0, "engine": failure.engine, "status": status}
 
-    def _flush_pending() -> None:
-        nonlocal pending_batch
-        if not pending_batch:
-            return
-        batch_statuses = _flush_page_batch(
-            client,
-            bucket,
-            document_id,
-            storage_key,
-            pending_batch,
-            content_type=content_type,
-            lang_hints=lang_hint_list,
-        )
-        statuses.extend(batch_statuses)
-        pending_batch = []
+        def _flush_pending() -> None:
+            nonlocal pending_batch
+            if not pending_batch:
+                return
+            batch_statuses = _flush_page_batch(
+                client,
+                bucket,
+                document_id,
+                storage_key,
+                pending_batch,
+                content_type=content_type,
+                lang_hints=lang_hint_list,
+            )
+            statuses.extend(batch_statuses)
+            pending_batch = []
 
-    for page_index, image_bytes in image_pages:
-        result = _ocr_image_with_model(image_bytes, page_index=page_index, lang_hints=lang_hints)
-        page_result = OCRResult(page_index, result.text or "", result.engine, result.error)
-        pending_batch.append(_PageBatchItem(page_index, page_result))
-        logger.info(
-            "Processed PDF page",
-            extra={
-                "document_id": document_id,
-                "page_index": page_index,
-                "status": "pending",
-                "engine": page_result.engine,
-                "error": page_result.error,
-            },
-        )
-        if len(pending_batch) >= _OCR_PAGE_FLUSH_BATCH:
-            _flush_pending()
+        for idx in range(page_total):
+            page_num = idx + 1
+            page = document[idx]
+            try:
+                text_content = _extract_pdf_page_text(page)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to extract text layer; falling back to OCR",
+                    extra={"document_id": document_id, "page_index": page_num, "error": str(exc)},
+                )
+                text_content = ""
 
-    _flush_pending()
+            if text_content:
+                result = OCRResult(page_num, text_content, "pdf_text")
+                logger.info(
+                    "Extracted PDF text layer",
+                    extra={
+                        "document_id": document_id,
+                        "page_index": page_num,
+                        "engine": result.engine,
+                        "chars": len(text_content),
+                    },
+                )
+            else:
+                try:
+                    image_bytes = _render_pdf_page_image(page, scale)
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to render PDF page",
+                        extra={"document_id": document_id, "page_index": page_num},
+                    )
+                    result = OCRResult(page_num, "", "paddleocr_error", f"pdf_render_failed: {exc}")
+                else:
+                    result = _ocr_image_with_model(image_bytes, page_index=page_num, lang_hints=lang_hints)
+                logger.info(
+                    "Processed PDF page",
+                    extra={
+                        "document_id": document_id,
+                        "page_index": page_num,
+                        "status": "pending",
+                        "engine": result.engine,
+                        "error": result.error,
+                    },
+                )
 
-    page_count = len(image_pages)
+            pending_batch.append(_PageBatchItem(page_num, result))
+            page.close()
+
+            if len(pending_batch) >= _OCR_PAGE_FLUSH_BATCH:
+                _flush_pending()
+
+        _flush_pending()
+
+    finally:
+        document.close()
+
+    page_count = len(statuses) if statuses else page_total
     doc_status = "ocr_done" if statuses and all(s == "ocr_done" for s in statuses) else "failed"
     try:
         _run_sync(
