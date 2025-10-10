@@ -16,7 +16,8 @@ _OCR_TASK_NAMES = {
 
 
 def _default_queue() -> str:
-    return _env("CELERY_DEFAULT_QUEUE", _env("CELERY_QUEUE", "default"))
+    value = _env("CELERY_DEFAULT_QUEUE", "").strip()
+    return value or "default"
 
 
 def _ocr_queue() -> str:
