@@ -1450,7 +1450,15 @@ def ocr_page(
     except Exception:
         done_all = False
     if done_all:
-        _maybe_enqueue_flashcards(document_id, count=20)
+        try:
+            print(f"[knowledge] queue document={document_id}")
+            celery_app.send_task("tasks.build_knowledge_cache", kwargs={"document_id": document_id})
+        except Exception:
+            pass
+        try:
+            celery_app.send_task("tasks.flashcards_generate", kwargs={"document_id": document_id, "count": 20})
+        except Exception:
+            pass
     return {"document_id": document_id, "page_index": page_index, "ocr_key": ocr_key}
 
 
@@ -1655,7 +1663,15 @@ def ocr_pdf_document(
     )
 
     if doc_status == "ocr_done":
-        _maybe_enqueue_flashcards(document_id, count=20)
+        try:
+            print(f"[knowledge] queue document={document_id}")
+            celery_app.send_task("tasks.build_knowledge_cache", kwargs={"document_id": document_id})
+        except Exception:
+            pass
+        try:
+            celery_app.send_task("tasks.flashcards_generate", kwargs={"document_id": document_id, "count": 20})
+        except Exception:
+            pass
 
     return {"document_id": document_id, "pages": page_count, "engine": "paddleocr", "status": doc_status}
 
